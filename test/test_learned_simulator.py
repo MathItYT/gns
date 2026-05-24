@@ -44,10 +44,12 @@ def test_encoder_preprocessor(simulator):
     nparticles_per_example = torch.tensor([2])
     particle_types = torch.tensor([0, 0])
 
-    node_features, edge_index, edge_features = simulator._encoder_preprocessor(
+    node_features, coors, edge_index, edge_features = simulator._encoder_preprocessor(
         position_sequence, nparticles_per_example, particle_types)
 
     assert node_features.shape == (2, 14)
+    assert coors.shape == (2, 2)
+    assert torch.equal(coors, position_sequence[:, -1])
     assert edge_index.shape == (2, 2)  # one edge between the 2 particles
     assert edge_features.shape == (2, 3)  # one edge with 3 features
 

@@ -120,6 +120,7 @@ class InteractionNetwork(MessagePassing):
       nedge_out: int,
       nmlp_layers: int,
       mlp_hidden_dim: int,
+      connectivity_radius: float = None,
   ):
     """InteractionNetwork derived from torch_geometric MessagePassing class
 
@@ -233,6 +234,83 @@ class InteractionNetwork(MessagePassing):
     return x_updated, self._edge_features
 
 
+class SparseEGNNInteractionNetwork(MessagePassing):
+  def __init__(
+      self,
+      nnode_in: int,
+      nnode_out: int,
+      nedge_in: int,
+      nedge_out: int,
+      nmlp_layers: int,
+      mlp_hidden_dim: int,
+      connectivity_radius: float = None,
+    ):
+    """Sparse EGNN-style interaction network without coordinate updates."""
+    super(SparseEGNNInteractionNetwork, self).__init__(aggr='add')
+    self._connectivity_radius = connectivity_radius
+    self.node_fn = nn.Sequential(*[build_mlp(nnode_in + nedge_out,
+                                             [mlp_hidden_dim
+                                              for _ in range(nmlp_layers)],
+                                             nnode_out),
+                                   nn.LayerNorm(nnode_out)])
+    self.edge_fn = nn.Sequential(*[build_mlp(nnode_in + nnode_in + 1 + nedge_in,
+                                             [mlp_hidden_dim
+                                              for _ in range(nmlp_layers)],
+                                             nedge_out),
+                                   nn.LayerNorm(nedge_out)])
+
+  def forward(self,
+              h: torch.tensor,
+              coors: torch.tensor,
+              edge_index: torch.tensor,
+              edge_features: torch.tensor):
+    """Applies one sparse EGNN-style message passing step.
+
+    Args:
+      h: Latent node features with shape (nparticles, latent_dim).
+      coors: Current particle coordinates with shape (nparticles, dim).
+      edge_index: Source and target nodes with shape (2, nedges).
+      edge_features: Latent edge features with shape (nedges, latent_dim).
+
+    Returns:
+      tuple: Updated node and edge features.
+    """
+    h_residual = h
+    edge_features_residual = edge_features
+    h, edge_features = self.propagate(
+        edge_index=edge_index, h=h, coors=coors, edge_features=edge_features)
+
+    return h + h_residual, edge_features + edge_features_residual
+
+  def message(self,
+              h_i: torch.tensor,
+              h_j: torch.tensor,
+              coors_i: torch.tensor,
+              coors_j: torch.tensor,
+              edge_features: torch.tensor) -> torch.tensor:
+    """Constructs EGNN-style messages using squared relative distance."""
+    rel_coors = coors_i - coors_j
+    dist2 = (rel_coors ** 2).sum(dim=-1, keepdim=True)
+    # Normalizing dist2 by connectivity radius squared to keep it in a similar
+    # range as the node and edge features.
+    if hasattr(self, '_connectivity_radius') and self._connectivity_radius is not None:
+      denom = float(self._connectivity_radius) ** 2
+      if denom != 0.0:
+        dist2 = dist2 / denom
+    edge_input = torch.cat([h_i, h_j, dist2, edge_features], dim=-1)
+    self._edge_features = self.edge_fn(edge_input)
+    return self._edge_features
+
+  def update(self,
+             h_updated: torch.tensor,
+             h: torch.tensor,
+             edge_features: torch.tensor):
+    """Updates node features after additive message aggregation."""
+    h_updated = torch.cat([h, h_updated], dim=-1)
+    h_updated = self.node_fn(h_updated)
+    return h_updated, self._edge_features
+
+
 class Processor(MessagePassing):
   """The Processor: :math: `\mathcal{G} \rightarrow \mathcal{G}` computes 
   interactions among nodes via :math: `M` steps of learned message-passing, to 
@@ -302,6 +380,42 @@ class Processor(MessagePassing):
     for gnn in self.gnn_stacks:
       x, edge_features = gnn(x, edge_index, edge_features)
     return x, edge_features
+
+
+class SparseEGNNProcessor(nn.Module):
+  """Stacks sparse EGNN-style interaction layers with fixed coordinates."""
+
+  def __init__(
+      self,
+      nnode_in: int,
+      nnode_out: int,
+      nedge_in: int,
+      nedge_out: int,
+      nmessage_passing_steps: int,
+      nmlp_layers: int,
+      mlp_hidden_dim: int,
+      connectivity_radius: float,
+  ):
+    super(SparseEGNNProcessor, self).__init__()
+    self.gnn_stacks = nn.ModuleList([
+      SparseEGNNInteractionNetwork(
+        nnode_in=nnode_in,
+        nnode_out=nnode_out,
+        nedge_in=nedge_in,
+        nedge_out=nedge_out,
+        nmlp_layers=nmlp_layers,
+        mlp_hidden_dim=mlp_hidden_dim,
+        connectivity_radius=connectivity_radius,
+      ) for _ in range(nmessage_passing_steps)])
+
+  def forward(self,
+              h: torch.tensor,
+              coors: torch.tensor,
+              edge_index: torch.tensor,
+              edge_features: torch.tensor):
+    for gnn in self.gnn_stacks:
+      h, edge_features = gnn(h, coors, edge_index, edge_features)
+    return h, edge_features
 
 
 class Decoder(nn.Module):
@@ -416,5 +530,56 @@ class EncodeProcessDecode(nn.Module):
     """
     x, edge_features = self._encoder(x, edge_features)
     x, edge_features = self._processor(x, edge_index, edge_features)
+    x = self._decoder(x)
+    return x
+
+
+class EncodeProcessDecodeSparseEGNN(nn.Module):
+  def __init__(
+      self,
+      nnode_in_features: int,
+      nnode_out_features: int,
+      nedge_in_features: int,
+      latent_dim: int,
+      nmessage_passing_steps: int,
+      nmlp_layers: int,
+      mlp_hidden_dim: int,
+      connectivity_radius: float,
+  ):
+    """Encode-Process-Decode model with a sparse EGNN-style processor."""
+    super(EncodeProcessDecodeSparseEGNN, self).__init__()
+    self._encoder = Encoder(
+        nnode_in_features=nnode_in_features,
+        nnode_out_features=latent_dim,
+        nedge_in_features=nedge_in_features,
+        nedge_out_features=latent_dim,
+        nmlp_layers=nmlp_layers,
+        mlp_hidden_dim=mlp_hidden_dim,
+    )
+    self._processor = SparseEGNNProcessor(
+        nnode_in=latent_dim,
+        nnode_out=latent_dim,
+        nedge_in=latent_dim,
+        nedge_out=latent_dim,
+        nmessage_passing_steps=nmessage_passing_steps,
+        nmlp_layers=nmlp_layers,
+        mlp_hidden_dim=mlp_hidden_dim,
+      connectivity_radius=connectivity_radius,
+    )
+    self._decoder = Decoder(
+        nnode_in=latent_dim,
+        nnode_out=nnode_out_features,
+        nmlp_layers=nmlp_layers,
+        mlp_hidden_dim=mlp_hidden_dim,
+    )
+
+  def forward(self,
+              x: torch.tensor,
+              coors: torch.tensor,
+              edge_index: torch.tensor,
+              edge_features: torch.tensor):
+    """Runs GNS encoder, sparse EGNN-style processor, and GNS decoder."""
+    x, edge_features = self._encoder(x, edge_features)
+    x, edge_features = self._processor(x, coors, edge_index, edge_features)
     x = self._decoder(x)
     return x

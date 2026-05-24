@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from absl import flags
 from absl import app
+import random
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from gns import learned_simulator
@@ -32,10 +33,14 @@ flags.DEFINE_string('output_path', 'rollouts/', help='The path for saving output
 flags.DEFINE_string('output_filename', 'rollout', help='Base name for saving the rollout')
 flags.DEFINE_string('model_file', None, help=('Model filename (.pt) to resume from. Can also use "latest" to default to newest file.'))
 flags.DEFINE_string('train_state_file', 'train_state.pt', help=('Train state filename (.pt) to resume from. Can also use "latest" to default to newest file.'))
+flags.DEFINE_enum(
+    'architecture', 'gns', ['gns', 'sparse_egnn'],
+    help="Model architecture: 'gns' or 'sparse_egnn'.")
 
 flags.DEFINE_integer('ntraining_steps', int(2E7), help='Number of training steps.')
 flags.DEFINE_integer('validation_interval', None, help='Validation interval. Set `None` if validation loss is not needed')
 flags.DEFINE_integer('nsave_steps', int(5000), help='Number of steps at which to save the model.')
+flags.DEFINE_integer('seed', 0, help='Random seed for reproducibility.')
 
 # Learning rate parameters
 flags.DEFINE_float('lr_init', 1e-4, help='Initial learning rate.')
@@ -553,7 +558,8 @@ def _get_simulator(
       nparticle_types=NUM_PARTICLE_TYPES,
       particle_type_embedding_size=16,
       boundary_clamp_limit=metadata["boundary_augment"] if "boundary_augment" in metadata else 1.0,
-      device=device)
+      device=device,
+      architecture=FLAGS.architecture)
 
   return simulator
 
@@ -613,6 +619,19 @@ def main(_):
     os.environ["MASTER_PORT"] = "29500"
 
   myflags = reading_utils.flags_to_dict(FLAGS)
+
+  # Set random seeds for reproducibility if provided
+  seed = myflags.get('seed', None)
+  if seed is not None:
+    try:
+      seed = int(seed)
+      torch.manual_seed(seed)
+      np.random.seed(seed)
+      random.seed(seed)
+      if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    except Exception:
+      pass
 
   if FLAGS.mode == 'train':
     # If model_path does not exist create new directory.

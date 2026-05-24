@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from gns import graph_network
-from torch_geometric.nn import radius_graph
-from typing import Dict
+from torch_geometric.nn import radius_graph as pyg_radius_graph
 
 
 class LearnedSimulator(nn.Module):
@@ -24,7 +23,8 @@ class LearnedSimulator(nn.Module):
           nparticle_types: int,
           particle_type_embedding_size: int,
           boundary_clamp_limit: float = 1.0,
-          device="cpu"
+          device="cpu",
+          architecture: str = "gns",
   ):
     """Initializes the model.
 
@@ -47,6 +47,7 @@ class LearnedSimulator(nn.Module):
       boundary_clamp_limit: a factor to enlarge connectivity radius used for computing
         normalized clipped distance in edge feature.
       device: Runtime device (cuda or cpu).
+      architecture: Model architecture. Either "gns" or "sparse_egnn".
 
     """
     super(LearnedSimulator, self).__init__()
@@ -61,16 +62,55 @@ class LearnedSimulator(nn.Module):
         nparticle_types, particle_type_embedding_size)
 
     # Initialize the EncodeProcessDecode
-    self._encode_process_decode = graph_network.EncodeProcessDecode(
-        nnode_in_features=nnode_in,
-        nnode_out_features=particle_dimensions,
-        nedge_in_features=nedge_in,
-        latent_dim=latent_dim,
-        nmessage_passing_steps=nmessage_passing_steps,
-        nmlp_layers=nmlp_layers,
-        mlp_hidden_dim=mlp_hidden_dim)
+    if architecture == "gns":
+      self._encode_process_decode = graph_network.EncodeProcessDecode(
+          nnode_in_features=nnode_in,
+          nnode_out_features=particle_dimensions,
+          nedge_in_features=nedge_in,
+          latent_dim=latent_dim,
+          nmessage_passing_steps=nmessage_passing_steps,
+          nmlp_layers=nmlp_layers,
+          mlp_hidden_dim=mlp_hidden_dim)
+    elif architecture == "sparse_egnn":
+      self._encode_process_decode = graph_network.EncodeProcessDecodeSparseEGNN(
+          nnode_in_features=nnode_in,
+          nnode_out_features=particle_dimensions,
+          nedge_in_features=nedge_in,
+          latent_dim=latent_dim,
+          nmessage_passing_steps=nmessage_passing_steps,
+          nmlp_layers=nmlp_layers,
+          mlp_hidden_dim=mlp_hidden_dim,
+          connectivity_radius=self._connectivity_radius)
+          
+    else:
+      raise ValueError(f"Unknown architecture: {architecture}")
 
     self._device = device
+    self._architecture = architecture
+    # store init configuration for saving with checkpoints
+    try:
+      boundaries_list = (self._boundaries.tolist()
+                         if hasattr(self._boundaries, 'tolist')
+                         else list(self._boundaries))
+    except Exception:
+      boundaries_list = None
+    self._init_config = {
+        'particle_dimensions': particle_dimensions,
+        'nnode_in': nnode_in,
+        'nedge_in': nedge_in,
+        'latent_dim': latent_dim,
+        'nmessage_passing_steps': nmessage_passing_steps,
+        'nmlp_layers': nmlp_layers,
+        'mlp_hidden_dim': mlp_hidden_dim,
+        'connectivity_radius': connectivity_radius,
+        'boundaries': boundaries_list,
+        'normalization_stats': normalization_stats,
+        'nparticle_types': nparticle_types,
+        'particle_type_embedding_size': particle_type_embedding_size,
+        'boundary_clamp_limit': boundary_clamp_limit,
+        'device': device,
+        'architecture': architecture,
+    }
 
   def forward(self):
     """Forward hook runs on class instantiation"""
@@ -98,15 +138,17 @@ class LearnedSimulator(nn.Module):
 
     # radius_graph accepts r < radius not r <= radius
     # A torch tensor list of source and target nodes with shape (2, nedges)
-    edge_index = radius_graph(
-        node_features, r=radius, batch=batch_ids, loop=add_self_edges, max_num_neighbors=128)
+    edge_index = pyg_radius_graph(
+        node_features, r=radius, batch=batch_ids, loop=add_self_edges,
+        max_num_neighbors=128)
 
     # The flow direction when using in combination with message passing is
-    # "source_to_target"
-    receivers = edge_index[0, :]
-    senders = edge_index[1, :]
+    # "source_to_target" where `edge_index[0]` are senders (sources) and
+    # `edge_index[1]` are receivers (targets).
+    senders = edge_index[0, :]
+    receivers = edge_index[1, :]
 
-    return receivers, senders
+    return senders, receivers
 
   def _encoder_preprocessor(
           self,
@@ -115,8 +157,8 @@ class LearnedSimulator(nn.Module):
           particle_types: torch.tensor,
           material_property: torch.tensor = None):
     """Extracts important features from the position sequence. Returns a tuple
-    of node_features (nparticles, 30), edge_index (nparticles, nparticles), and
-    edge_features (nparticles, 3).
+    of node_features (nparticles, 30), coors (nparticles, dim), edge_index
+    (nparticles, nparticles), and edge_features (nparticles, 3).
 
     Args:
       position_sequence: A sequence of particle positions. Shape is
@@ -132,7 +174,7 @@ class LearnedSimulator(nn.Module):
 
     # Get connectivity of the graph with shape of (nparticles, 2)
     senders, receivers = self._compute_graph_connectivity(
-        most_recent_position, nparticles_per_example, self._connectivity_radius)
+      most_recent_position, nparticles_per_example, self._connectivity_radius)
     node_features = []
 
     # Normalized velocity sequence, merging spatial an time axis.
@@ -202,9 +244,24 @@ class LearnedSimulator(nn.Module):
         normalized_relative_displacements, dim=-1, keepdim=True)
     edge_features.append(normalized_relative_distances)
 
+    # Verify that the edge_index convention matches the computed displacements
+    # (debug check to catch sender/receiver swaps). This compares the
+    # displacement computed from indices with the displacement we just
+    # constructed. If mismatched, raise an informative error.
+    edge_index = torch.stack([senders, receivers])
+    # Reconstruct relative displacements from edge_index
+    rel_disp_from_index = (most_recent_position[edge_index[0]] -
+                 most_recent_position[edge_index[1]]) / self._connectivity_radius
+    if not torch.allclose(rel_disp_from_index, normalized_relative_displacements, atol=1e-6):
+      raise ValueError(
+        "Sender/receiver convention mismatch: edge_index does not match "
+        "computed relative displacements. Ensure edge_index[0]=senders, "
+        "edge_index[1]=receivers (source->target) before decoding.")
+
     return (torch.cat(node_features, dim=-1),
-            torch.stack([senders, receivers]),
-            torch.cat(edge_features, dim=-1))
+        most_recent_position,
+        edge_index,
+        torch.cat(edge_features, dim=-1))
 
   def _decoder_postprocessor(
           self,
@@ -257,13 +314,17 @@ class LearnedSimulator(nn.Module):
       next_positions (torch.tensor): Next position of particles.
     """
     if material_property is not None:
-        node_features, edge_index, edge_features = self._encoder_preprocessor(
+        node_features, coors, edge_index, edge_features = self._encoder_preprocessor(
             current_positions, nparticles_per_example, particle_types, material_property)
     else:
-        node_features, edge_index, edge_features = self._encoder_preprocessor(
+        node_features, coors, edge_index, edge_features = self._encoder_preprocessor(
             current_positions, nparticles_per_example, particle_types)
-    predicted_normalized_acceleration = self._encode_process_decode(
-        node_features, edge_index, edge_features)
+    if self._architecture == "sparse_egnn":
+      predicted_normalized_acceleration = self._encode_process_decode(
+          node_features, coors, edge_index, edge_features)
+    else:
+      predicted_normalized_acceleration = self._encode_process_decode(
+          node_features, edge_index, edge_features)
     next_positions = self._decoder_postprocessor(
         predicted_normalized_acceleration, current_positions)
     return next_positions
@@ -301,13 +362,17 @@ class LearnedSimulator(nn.Module):
 
     # Perform the forward pass with the noisy position sequence.
     if material_property is not None:
-        node_features, edge_index, edge_features = self._encoder_preprocessor(
+        node_features, coors, edge_index, edge_features = self._encoder_preprocessor(
             noisy_position_sequence, nparticles_per_example, particle_types, material_property)
     else:
-        node_features, edge_index, edge_features = self._encoder_preprocessor(
+        node_features, coors, edge_index, edge_features = self._encoder_preprocessor(
             noisy_position_sequence, nparticles_per_example, particle_types)
-    predicted_normalized_acceleration = self._encode_process_decode(
-        node_features, edge_index, edge_features)
+    if self._architecture == "sparse_egnn":
+      predicted_normalized_acceleration = self._encode_process_decode(
+          node_features, coors, edge_index, edge_features)
+    else:
+      predicted_normalized_acceleration = self._encode_process_decode(
+          node_features, edge_index, edge_features)
 
     # Calculate the target acceleration, using an `adjusted_next_position `that
     # is shifted by the noise in the last input position.
@@ -353,13 +418,16 @@ class LearnedSimulator(nn.Module):
 
   def save(
           self,
-          path: str = 'model.pt'):
+          path: str = 'model.pt',
+          config: dict = None):
     """Save model state
 
     Args:
       path: Model path
     """
-    torch.save(self.state_dict(), path)
+    payload = {'state_dict': self.state_dict()}
+    payload['config'] = config if config is not None else self._init_config
+    torch.save(payload, path)
 
   def load(
           self,
@@ -369,7 +437,18 @@ class LearnedSimulator(nn.Module):
     Args:
       path: Model path
     """
-    self.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
+    loaded = torch.load(path, map_location=torch.device('cpu'))
+    # Support both legacy plain state_dict and new payload format
+    if isinstance(loaded, dict) and 'state_dict' in loaded:
+      state = loaded['state_dict']
+      self.load_state_dict(state)
+      if 'config' in loaded:
+        self._init_config = loaded['config']
+        return loaded['config']
+    else:
+      # assume it's a raw state dict
+      self.load_state_dict(loaded)
+    return None
 
 
 def time_diff(
