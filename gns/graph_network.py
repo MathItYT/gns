@@ -46,7 +46,7 @@ def build_mlp(
 
 
 class Encoder(nn.Module):
-  """Graph network encoder. Encode nodes and edges states to an MLP. The Encode:
+  r"""Graph network encoder. Encode nodes and edges states to an MLP. The Encode:
   :math: `\mathcal{X} \rightarrow \mathcal{G}` embeds the particle-based state
   representation, :math: `\mathcal{X}`, as a latent graph, :math:
   `G^0 = encoder(\mathcal{X})`, where :math: `G = (V, E, u), v_i \in V`, and
@@ -312,7 +312,7 @@ class SparseEGNNInteractionNetwork(MessagePassing):
 
 
 class Processor(MessagePassing):
-  """The Processor: :math: `\mathcal{G} \rightarrow \mathcal{G}` computes 
+  r"""The Processor: :math: `\mathcal{G} \rightarrow \mathcal{G}` computes 
   interactions among nodes via :math: `M` steps of learned message-passing, to 
   generate a sequence of updated latent graphs, :math: `G = (G_1 , ..., G_M )`, 
   where :math: `G^{m+1| = GN^{m+1} (G^m )`. It returns the final graph, 
@@ -419,7 +419,7 @@ class SparseEGNNProcessor(nn.Module):
 
 
 class Decoder(nn.Module):
-  """The Decoder: :math: `\mathcal{G} \rightarrow \mathcal{Y}` extracts the 
+  r"""The Decoder: :math: `\mathcal{G} \rightarrow \mathcal{Y}` extracts the 
   dynamics information from the nodes of the final latent graph, 
   :math: `y_i = \delta v (v_i^M)`
 
@@ -431,7 +431,7 @@ class Decoder(nn.Module):
           nnode_out: int,
           nmlp_layers: int,
           mlp_hidden_dim: int):
-    """The Decoder coder's learned function, :math: `\detla v`, is an MLP. 
+    r"""The Decoder coder's learned function, :math: `\detla v`, is an MLP. 
     After the Decoder, the future position and velocity are updated using an 
     Euler integrator, so the :math: `yi` corresponds to accelerations, 
     :math: `\"{p}_i`, with 2D or 3D dimension, depending on the physical domain.

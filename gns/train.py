@@ -26,7 +26,7 @@ flags.DEFINE_enum(
     'mode', 'train', ['train', 'valid', 'rollout'],
     help='Train model, validation or rollout evaluation.')
 flags.DEFINE_integer('batch_size', 2, help='The batch size.')
-flags.DEFINE_float('noise_std', 6.7e-4, help='The std deviation of the noise.')
+flags.DEFINE_float('noise_std', 3e-4, help='The std deviation of the noise.')
 flags.DEFINE_string('data_path', None, help='The dataset directory.')
 flags.DEFINE_string('model_path', 'models/', help=('The path for saving checkpoints of the model.'))
 flags.DEFINE_string('output_path', 'rollouts/', help='The path for saving outputs (e.g. rollouts).')
@@ -38,12 +38,12 @@ flags.DEFINE_enum(
     help="Model architecture: 'gns' or 'sparse_egnn'.")
 
 flags.DEFINE_integer('ntraining_steps', int(2E7), help='Number of training steps.')
-flags.DEFINE_integer('validation_interval', None, help='Validation interval. Set `None` if validation loss is not needed')
+flags.DEFINE_integer('validation_interval', 0, help='Validation interval in steps. Set to 0 to disable validation.')
 flags.DEFINE_integer('nsave_steps', int(5000), help='Number of steps at which to save the model.')
 flags.DEFINE_integer('seed', 0, help='Random seed for reproducibility.')
 
 # Learning rate parameters
-flags.DEFINE_float('lr_init', 1e-4, help='Initial learning rate.')
+flags.DEFINE_float('lr_init', 1e-5, help='Initial learning rate.')
 flags.DEFINE_float('lr_decay', 0.1, help='Learning rate decay.')
 flags.DEFINE_integer('lr_decay_steps', int(5e6), help='Learning rate decay steps.')
 
@@ -133,7 +133,7 @@ def predict(device: str):
   """
   # Read metadata
   metadata = reading_utils.read_metadata(FLAGS.data_path, "rollout")
-  simulator = _get_simulator(metadata, FLAGS.noise_std, FLAGS.noise_std, device)
+  simulator = _get_simulator(metadata, FLAGS.noise_std, FLAGS.noise_std, FLAGS.architecture, device)
 
   # Load simulator
   if os.path.exists(FLAGS.model_path + FLAGS.model_file):
@@ -291,11 +291,11 @@ def train(rank, flags, world_size, device):
 
   # Get simulator and optimizer
   if device == torch.device("cuda"):
-    serial_simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], rank)
+    serial_simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], flags["architecture"], rank)
     simulator = DDP(serial_simulator.to(rank), device_ids=[rank], output_device=rank)
     optimizer = torch.optim.Adam(simulator.parameters(), lr=flags["lr_init"]*world_size)
   else:
-    simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], device)
+    simulator = _get_simulator(metadata, flags["noise_std"], flags["noise_std"], flags["architecture"], device)
     optimizer = torch.optim.Adam(simulator.parameters(), lr=flags["lr_init"] * world_size)
 
   # Initialize training state
@@ -317,7 +317,7 @@ def train(rank, flags, world_size, device):
       # find the latest model, assumes model and train_state files are in step.
       fnames = glob.glob(f'{flags["model_path"]}*model*pt')
       max_model_number = 0
-      expr = re.compile(".*model-(\d+).pt")
+      expr = re.compile(r".*model-(\d+).pt")
       for fname in fnames:
         model_num = int(expr.search(fname).groups()[0])
         if model_num > max_model_number:
@@ -371,7 +371,7 @@ def train(rank, flags, world_size, device):
   n_features = len(dl.dataset._data[0])
 
   # Load validation data
-  if flags["validation_interval"] is not None:
+  if flags["validation_interval"] > 0:
       dl_valid = get_data_loader(
           path=f'{flags["data_path"]}valid.npz',
           input_length_sequence=INPUT_SEQUENCE_LENGTH,
@@ -386,7 +386,7 @@ def train(rank, flags, world_size, device):
 
   try:
     while step < flags["ntraining_steps"]:
-      if device == torch.device("cuda"):
+      if device == torch.device("cuda") and world_size > 1:
         torch.distributed.barrier()
 
       for example in dl:  
@@ -424,12 +424,15 @@ def train(rank, flags, world_size, device):
         )
         
         # Validation
-        if flags["validation_interval"] is not None:
+        if (
+            flags["validation_interval"] > 0
+            and step > 0
+            and step % flags["validation_interval"] == 0
+        ):
           sampled_valid_example = next(iter(dl_valid))
-          if step > 0 and step % flags["validation_interval"] == 0:
-              valid_loss = validation(
-                simulator, sampled_valid_example, n_features, flags, rank, device_id)
-              print(f"Validation loss at {step}: {valid_loss.item()}")
+          valid_loss = validation(
+            simulator, sampled_valid_example, n_features, flags, rank, device_id)
+          print(f"Validation loss at {step}: {valid_loss.item()}")
 
         # Calculate the loss and mask out loss on kinematic particles
         loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
@@ -440,6 +443,8 @@ def train(rank, flags, world_size, device):
         # Computes the gradient of loss
         optimizer.zero_grad()
         loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(simulator.parameters(), max_norm=1.0)
         optimizer.step()
 
         # Update learning rate
@@ -470,7 +475,7 @@ def train(rank, flags, world_size, device):
       train_loss_hist.append((epoch, epoch_train_loss.item()))
 
       # Validation loss at epoch
-      if flags["validation_interval"] is not None:
+      if flags["validation_interval"] > 0:
         sampled_valid_example = next(iter(dl_valid))
         epoch_valid_loss = validation(
                 simulator, sampled_valid_example, n_features, flags, rank, device_id)
@@ -483,7 +488,7 @@ def train(rank, flags, world_size, device):
       # Print epoch statistics
       if rank == 0 or device == torch.device("cpu"):
         print(f'Epoch {epoch}, training loss: {epoch_train_loss.item()}')
-        if flags["validation_interval"] is not None:
+        if flags["validation_interval"] > 0:
           print(f'Epoch {epoch}, validation loss: {epoch_valid_loss.item()}')
       
       # Reset epoch training loss
@@ -506,10 +511,11 @@ def train(rank, flags, world_size, device):
 
 
 def _get_simulator(
-        metadata: json,
-        acc_noise_std: float,
-        vel_noise_std: float,
-        device: torch.device) -> learned_simulator.LearnedSimulator:
+  metadata: json,
+  acc_noise_std: float,
+  vel_noise_std: float,
+  architecture: str,
+  device: torch.device) -> learned_simulator.LearnedSimulator:
   """Instantiates the simulator.
 
   Args:
@@ -559,7 +565,7 @@ def _get_simulator(
       particle_type_embedding_size=16,
       boundary_clamp_limit=metadata["boundary_augment"] if "boundary_augment" in metadata else 1.0,
       device=device,
-      architecture=FLAGS.architecture)
+      architecture=architecture)
 
   return simulator
 

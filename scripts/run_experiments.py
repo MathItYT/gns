@@ -25,6 +25,8 @@ def parse_args():
     p.add_argument('--architectures', default=','.join(DEFAULT_ARCHS))
     p.add_argument('--ntraining_steps', type=int, default=None)
     p.add_argument('--model_path', default='models/')
+    p.add_argument('--validation_interval', type=int, default=0,
+                   help='Validation interval passed to training. Use 0 to disable validation.')
     p.add_argument('--extra', default='', help='Extra flags to forward to training (quoted)')
     p.add_argument('--dry_run', action='store_true')
     return p.parse_args()
@@ -50,6 +52,7 @@ def main():
                 f'--model_path={out_dir}/',
                 f'--data_path={args.data_path}',
                 f'--seed={seed}',
+                f'--validation_interval={args.validation_interval}',
             ]
             if args.ntraining_steps is not None:
                 cmd.append(f'--ntraining_steps={args.ntraining_steps}')
@@ -69,8 +72,8 @@ def main():
             with open(stdout_path, 'wb') as out_f, open(stderr_path, 'wb') as err_f:
                 # limit OpenMP threads to reduce resource contention
                 env = os.environ.copy()
-                env.setdefault('OMP_NUM_THREADS', '1')
-                env.setdefault('MKL_NUM_THREADS', '1')
+                # env.setdefault('OMP_NUM_THREADS', '1')
+                # env.setdefault('MKL_NUM_THREADS', '1')
                 proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, env=env)
                 ret = proc.wait()
             if ret != 0:
