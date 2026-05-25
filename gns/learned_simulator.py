@@ -120,8 +120,7 @@ class LearnedSimulator(nn.Module):
           self,
           node_features: torch.tensor,
           nparticles_per_example: torch.tensor,
-          radius: float,
-          add_self_edges: bool = True):
+          radius: float):
     """Generate graph edges to all particles within a threshold radius
 
     Args:
@@ -129,7 +128,6 @@ class LearnedSimulator(nn.Module):
       nparticles_per_example: Number of particles per example. Default is 2
         examples per batch.
       radius: Threshold to construct edges to all particles within the radius.
-      add_self_edges: Boolean flag to include self edge (default: True)
     """
     # Specify examples id for particles
     batch_ids = torch.cat(
@@ -139,8 +137,8 @@ class LearnedSimulator(nn.Module):
     # radius_graph accepts r < radius not r <= radius
     # A torch tensor list of source and target nodes with shape (2, nedges)
     edge_index = pyg_radius_graph(
-        node_features, r=radius, batch=batch_ids, loop=add_self_edges,
-        max_num_neighbors=128)
+      node_features, r=radius, batch=batch_ids, loop=True,
+      max_num_neighbors=128)
 
     # The flow direction when using in combination with message passing is
     # "source_to_target" where `edge_index[0]` are senders (sources) and
@@ -240,8 +238,9 @@ class LearnedSimulator(nn.Module):
 
     # Add relative distance between 2 particles with shape (nparticles, 1)
     # Edge features has a final shape of (nparticles, ndim + 1)
-    normalized_relative_distances = torch.norm(
-        normalized_relative_displacements, dim=-1, keepdim=True)
+    normalized_relative_distances = torch.sqrt(
+        torch.sum(normalized_relative_displacements**2, dim=-1, keepdim=True) + 1e-8
+    )
     edge_features.append(normalized_relative_distances)
 
     # Verify that the edge_index convention matches the computed displacements
